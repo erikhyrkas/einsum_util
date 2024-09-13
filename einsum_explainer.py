@@ -1,7 +1,3 @@
-import operator
-from functools import reduce
-
-
 class EinsumExplainer:
     def __init__(self, einsum_expression: str, *matrix_specs):
         self.inputs, self.output = einsum_expression.split('->')
@@ -42,63 +38,28 @@ class EinsumExplainer:
         explanation = []
         total_flops = 0
 
-        # Identify summed dimensions
-        input_dims = set(''.join(self.input_subscripts))
-        output_dims = set(self.output)
-        summed_dims = input_dims - output_dims
-
         if len(self.matrix_names) == 1:
             operation_description = f"Operation: Transform {self.matrix_names[0]} to match output subscripts '{self.output}'"
-            explanation.append(operation_description)
-
-            # FLOPs calculation
-            flops = self._calculate_total_flops_single_input()
-            total_flops += flops
-
-            # Generate detailed explanation
-            detailed_explanation = self._generate_detailed_explanation_single_input()
-            explanation.extend(detailed_explanation)
         else:
             operation_description = f"Operation: Contract tensors {', '.join(self.matrix_names)} over subscripts '{self.inputs}' to get '{self.output}'"
-            explanation.append(operation_description)
 
-            # FLOPs calculation
-            flops = self._calculate_total_flops()
-            total_flops += flops
+        explanation.append(operation_description)
 
-            # Generate detailed explanation
-            detailed_explanation = self._generate_detailed_explanation_multi_input()
-            explanation.extend(detailed_explanation)
+        # FLOPs calculation
+        flops = self._calculate_total_flops()
+        total_flops += flops
+
+        # Generate detailed explanation
+        detailed_explanation = self._generate_detailed_explanation()
+        explanation.extend(detailed_explanation)
 
         explanation.append(f"\nTotal FLOPs: {total_flops:,}")
         return explanation
 
-    def _generate_detailed_explanation_single_input(self):
+    def _generate_detailed_explanation(self):
         explanation = []
-        dim_to_size = self._get_dim_sizes_single_input()
-        summed_dims = set(self.input_subscripts[0]) - set(self.output)
-
-        # Explain dimensions involved in the operation
-        explanation.append("\nDetailed Steps:")
-        for dim in sorted(dim_to_size.keys()):
-            if dim in summed_dims:
-                explanation.append(f"- Dimension '{dim}' of size {dim_to_size[dim]} is summed over.")
-            elif dim in self.output:
-                explanation.append(f"- Dimension '{dim}' of size {dim_to_size[dim]} is retained in the output.")
-            else:
-                explanation.append(f"- Dimension '{dim}' is not present in the output.")
-
-        # Generate pseudo-code
-        pseudo_code = self._generate_pseudo_code_single_input(summed_dims, dim_to_size)
-        explanation.append("\nPseudo-code for the operation:")
-        explanation.extend(pseudo_code)
-
-        return explanation
-
-    def _generate_detailed_explanation_multi_input(self):
-        explanation = []
-        summed_dims = set(''.join(self.input_subscripts)) - set(self.output)
         dim_to_size = self._get_dim_sizes()
+        summed_dims = self._get_summed_dims()
 
         # Explain dimensions involved in the operation
         explanation.append("\nDetailed Steps:")
@@ -111,11 +72,19 @@ class EinsumExplainer:
                 explanation.append(f"- Dimension '{dim}' is not present in the output.")
 
         # Generate pseudo-code
-        pseudo_code = self._generate_pseudo_code_multi_input(summed_dims, dim_to_size)
+        if len(self.matrix_names) == 1:
+            pseudo_code = self._generate_pseudo_code_single_input(summed_dims, dim_to_size)
+        else:
+            pseudo_code = self._generate_pseudo_code_multi_input(summed_dims, dim_to_size)
         explanation.append("\nPseudo-code for the operation:")
         explanation.extend(pseudo_code)
 
         return explanation
+
+    def _get_summed_dims(self):
+        input_dims = set(''.join(self.input_subscripts))
+        output_dims = set(self.output)
+        return input_dims - output_dims
 
     def _generate_pseudo_code_single_input(self, summed_dims, dim_to_size):
         pseudo_code = []
@@ -198,20 +167,26 @@ class EinsumExplainer:
         return pseudo_code
 
     def _calculate_total_flops(self):
-        # Simplified FLOPs calculation: number of multiplications and additions
         dim_to_size = self._get_dim_sizes()
         total_elements = 1
         for dim in self.output:
             total_elements *= dim_to_size[dim]
-        summed_dims = set(''.join(self.input_subscripts)) - set(self.output)
+        summed_dims = self._get_summed_dims()
         if summed_dims:
             summed_elements = 1
             for dim in summed_dims:
                 summed_elements *= dim_to_size[dim]
-            flops = 2 * total_elements * summed_elements  # Multiply and add
+            if len(self.matrix_names) == 1:
+                # For single input with summation
+                additions_per_output_element = summed_elements - 1
+                flops = total_elements * additions_per_output_element  # Number of additions
+            else:
+                flops = 2 * total_elements * summed_elements  # Multiply and add
         else:
-            # No summation, so only multiplications per output element
-            flops = total_elements  # One multiplication per output element
+            if len(self.matrix_names) == 1:
+                flops = 0  # No arithmetic operations
+            else:
+                flops = total_elements * (len(self.matrix_names) - 1)  # Multiplications only
         return flops
 
     def _calculate_total_flops_single_input(self):
