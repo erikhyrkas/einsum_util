@@ -1,12 +1,15 @@
 # Einsum Utilities
 
-This project provides two powerful utilities for working with Einstein summation (einsum) expressions in Python:
+This project provides two utilities for working with Einstein summation (einsum) expressions in Python:
 
 1. **EinsumGeneratorUtil**: A utility for building einsum expressions.
 2. **EinsumExplainer**: A utility for explaining and validating einsum expressions.
 
 These tools are designed to make working with einsum expressions easier, more intuitive, and less error-prone.
 
+## Motivation
+
+Working with einsum is easy, until it isn't. I created these utilities to help me validate my assumptions and make sure that my code was right.
 ## Features
 
 ### EinsumGeneratorUtil
