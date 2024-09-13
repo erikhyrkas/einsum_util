@@ -6,6 +6,15 @@ class EinsumExplainer:
         self.matrix_shapes = {spec[0]: spec[1] for spec in matrix_specs}
         self.output_dims = set(self.output)
         self.matrix_shapes_ordered = [spec[1] for spec in matrix_specs]
+        self.operation_type = self._categorize_operation()
+
+    def _categorize_operation(self):
+        if len(self.matrix_names) == 1:
+            return "single_input"
+        elif len(self.matrix_names) == 2:
+            return "two_input"
+        else:
+            return "multi_input"
 
     def parse_einsum(self):
         explanation = [
@@ -167,42 +176,61 @@ class EinsumExplainer:
         return pseudo_code
 
     def _calculate_total_flops(self):
-        dim_to_size = self._get_dim_sizes()
-        total_elements = 1
-        for dim in self.output:
-            total_elements *= dim_to_size[dim]
-        summed_dims = self._get_summed_dims()
-        if summed_dims:
-            summed_elements = 1
-            for dim in summed_dims:
-                summed_elements *= dim_to_size[dim]
-            if len(self.matrix_names) == 1:
-                # For single input with summation
-                additions_per_output_element = summed_elements - 1
-                flops = total_elements * additions_per_output_element  # Number of additions
-            else:
-                flops = 2 * total_elements * summed_elements  # Multiply and add
+        if self.operation_type == "single_input":
+            return self._calculate_flops_single_input()
+        elif self.operation_type == "two_input":
+            return self._calculate_flops_two_input()
         else:
-            if len(self.matrix_names) == 1:
-                flops = 0  # No arithmetic operations
-            else:
-                flops = total_elements * (len(self.matrix_names) - 1)  # Multiplications only
-        return flops
+            return self._calculate_flops_multi_input()
 
-    def _calculate_total_flops_single_input(self):
-        # Simplified FLOPs calculation for single input tensor
-        dim_to_size = self._get_dim_sizes_single_input()
-        summed_dims = set(self.input_subscripts[0]) - set(self.output)
+    def _calculate_flops_single_input(self):
+        summed_dims = self._get_summed_dims()
         if not summed_dims:
-            return 0  # No arithmetic operations
-        total_elements = 1
+            return 0  # Transpose-like operations
+        elif len(self.output) == 0:
+            return len(self._get_dim_sizes()) - 1  # Trace-like operations
+        else:
+            return self._calculate_sum_flops()  # Sum over axis
+
+    def _calculate_flops_two_input(self):
+        summed_dims = self._get_summed_dims()
+        if not summed_dims:
+            return self._calculate_outer_product_flops()
+        else:
+            return self._calculate_matrix_multiply_flops()
+
+    def _calculate_flops_multi_input(self):
+        return self._calculate_complex_flops()
+
+    def _calculate_sum_flops(self):
+        dim_sizes = self._get_dim_sizes()
+        output_size = 1
         for dim in self.output:
-            total_elements *= dim_to_size[dim]
-        summed_elements = 1
+            output_size *= dim_sizes[dim]
+        total_size = 1
+        for dim in self.input_subscripts[0]:
+            total_size *= dim_sizes[dim]
+        return total_size - output_size  # Subtracting output_size to account for the first assignment
+
+    def _calculate_outer_product_flops(self):
+        return self._get_output_size()  # One multiplication per output element
+
+    def _calculate_matrix_multiply_flops(self):
+        dim_sizes = self._get_dim_sizes()
+        output_size = self._get_output_size()
+        summed_dim = list(self._get_summed_dims())[0]
+        return output_size * dim_sizes[
+            summed_dim] * 2 - output_size  # Multiplications and additions, minus initial assignments
+
+    def _calculate_complex_flops(self):
+        dim_sizes = self._get_dim_sizes()
+        output_size = self._get_output_size()
+        summed_dims = self._get_summed_dims()
+        elements_per_sum = 1
         for dim in summed_dims:
-            summed_elements *= dim_to_size[dim]
-        flops = total_elements * summed_elements  # Only additions in summations
-        return flops
+            elements_per_sum *= dim_sizes[dim]
+        return output_size * elements_per_sum * (2 * len(
+            self.matrix_names) - 1) - output_size  # Multiplications and additions, minus initial assignments
 
     def _get_dim_sizes(self):
         dim_sizes = {}
@@ -212,6 +240,13 @@ class EinsumExplainer:
                     raise ValueError(f"Inconsistent sizes for dimension '{dim}': {dim_sizes[dim]} vs {size}")
                 dim_sizes[dim] = size
         return dim_sizes
+
+    def _get_output_size(self):
+        dim_sizes = self._get_dim_sizes()
+        output_size = 1
+        for dim in self.output:
+            output_size *= dim_sizes[dim]
+        return output_size
 
     def _get_dim_sizes_single_input(self):
         dim_sizes = {}
@@ -326,7 +361,7 @@ def test():
              "ab,bc,cd->ad",
              [('matrix_a', [2, 3]),
               ('matrix_b', [3, 4]),
-              ('matrix_c', [4, 6])])  # Corrected shape to [4, 6] to be compatible
+              ('matrix_c', [5, 6])])
 
 
 if __name__ == '__main__':
