@@ -9,12 +9,13 @@ class EinsumExplainer:
         self.matrix_names = [spec[0] for spec in matrix_specs]
         self.matrix_shapes = {spec[0]: spec[1] for spec in matrix_specs}
         self.output_dims = set(self.output)
+        self.matrix_shapes_ordered = [spec[1] for spec in matrix_specs]
 
     def parse_einsum(self):
         explanation = [
             f"Explaining einsum operation:",
             f"result = tensor.einsum('{self.inputs}->{self.output}', {', '.join(self.matrix_names)})\n",
-            "Input Matrices:"
+            "Input Tensors:"
         ]
 
         for matrix_name, subscripts in zip(self.matrix_names, self.input_subscripts):
@@ -24,7 +25,7 @@ class EinsumExplainer:
 
         explanation.append("\nOperations:")
         try:
-            explanation.extend(self._explain_recursive(self.input_subscripts, self.matrix_names, self.matrix_shapes))
+            explanation.extend(self._explain_operations())
 
             output_shape = self._calculate_output_shape()
             output_str = f"{', '.join(f'{dim}:{size}' for dim, size in zip(self.output, output_shape))}" if output_shape else "scalar"
@@ -37,76 +38,222 @@ class EinsumExplainer:
 
         return "\n".join(explanation)
 
-    def _explain_recursive(self, input_subscripts, matrix_names, matrix_shapes):
+    def _explain_operations(self):
         explanation = []
-        remaining_subscripts = list(input_subscripts)
-        remaining_matrices = list(matrix_names)
-        remaining_shapes = [matrix_shapes[name] for name in matrix_names]
         total_flops = 0
 
-        while len(remaining_matrices) > 1:
-            num_inputs = min(3, len(remaining_matrices))  # Handle up to 3 inputs at once
-            current_subscripts = remaining_subscripts[:num_inputs]
-            current_matrices = remaining_matrices[:num_inputs]
-            current_shapes = remaining_shapes[:num_inputs]
+        # Identify summed dimensions
+        input_dims = set(''.join(self.input_subscripts))
+        output_dims = set(self.output)
+        summed_dims = input_dims - output_dims
 
-            new_subscripts, summed_dims = self._calculate_output_subscripts(*current_subscripts)
-
-            try:
-                self._validate_shapes(current_subscripts, current_shapes, summed_dims)
-            except ValueError as e:
-                explanation.append(f"Error: {str(e)}")
-                return explanation
-
-            new_shape = self._calculate_intermediate_shape(new_subscripts, current_subscripts, current_shapes)
-
-            input_str = ", ".join([f"{matrix}[{', '.join(f'{dim}:{size}' for dim, size in zip(subs, shape))}]"
-                                   for matrix, subs, shape in
-                                   zip(current_matrices, current_subscripts, current_shapes)])
-            new_str = f"intermediate[{', '.join(f'{dim}:{size}' for dim, size in zip(new_subscripts, new_shape))}]"
-
-            operation_description = f"{len(explanation) + 1}. Tensor contraction({input_str}) -> {new_str}"
-            if summed_dims:
-                operation_description += f" (summing over {', '.join(sorted(summed_dims))})"
-            else:
-                operation_description += " (element-wise operation, no summation)"
-
-            # Calculate FLOPs for this operation
-            flops = self._calculate_flops(current_shapes, new_shape, summed_dims)
-            total_flops += flops
-            operation_description += f" [FLOPs: {flops:,}]"
-
+        if len(self.matrix_names) == 1:
+            operation_description = f"Operation: Transform {self.matrix_names[0]} to match output subscripts '{self.output}'"
             explanation.append(operation_description)
 
-            remaining_matrices = ['intermediate'] + remaining_matrices[num_inputs:]
-            remaining_subscripts = [new_subscripts] + remaining_subscripts[num_inputs:]
-            remaining_shapes = [new_shape] + remaining_shapes[num_inputs:]
-
-        # Handle single-input operations
-        if len(remaining_matrices) == 1:
-            input_subscripts = remaining_subscripts[0]
-            output_subscripts = self.output
-            input_shape = remaining_shapes[0]
-            output_shape = self._calculate_output_shape()
-            summed_dims = set(input_subscripts) - set(output_subscripts)
-
-            flops = self._calculate_flops([input_shape], output_shape, summed_dims)
+            # FLOPs calculation
+            flops = self._calculate_total_flops_single_input()
             total_flops += flops
 
-            operation_description = f"{len(explanation) + 1}. Single-input operation: {remaining_matrices[0]} -> result"
-            if summed_dims:
-                operation_description += f" (summing over {', '.join(sorted(summed_dims))})"
-            operation_description += f" [FLOPs: {flops:,}]"
-
-            if flops == 0:
-                operation_description += " (This operation is a simple reshape or view, requiring no arithmetic operations)"
-            elif flops < len(input_shape) * 2:
-                operation_description += " (This operation involves selective element access or simple reduction)"
-
+            # Generate detailed explanation
+            detailed_explanation = self._generate_detailed_explanation_single_input()
+            explanation.extend(detailed_explanation)
+        else:
+            operation_description = f"Operation: Contract tensors {', '.join(self.matrix_names)} over subscripts '{self.inputs}' to get '{self.output}'"
             explanation.append(operation_description)
+
+            # FLOPs calculation
+            flops = self._calculate_total_flops()
+            total_flops += flops
+
+            # Generate detailed explanation
+            detailed_explanation = self._generate_detailed_explanation_multi_input()
+            explanation.extend(detailed_explanation)
 
         explanation.append(f"\nTotal FLOPs: {total_flops:,}")
         return explanation
+
+    def _generate_detailed_explanation_single_input(self):
+        explanation = []
+        dim_to_size = self._get_dim_sizes_single_input()
+        summed_dims = set(self.input_subscripts[0]) - set(self.output)
+
+        # Explain dimensions involved in the operation
+        explanation.append("\nDetailed Steps:")
+        for dim in sorted(dim_to_size.keys()):
+            if dim in summed_dims:
+                explanation.append(f"- Dimension '{dim}' of size {dim_to_size[dim]} is summed over.")
+            elif dim in self.output:
+                explanation.append(f"- Dimension '{dim}' of size {dim_to_size[dim]} is retained in the output.")
+            else:
+                explanation.append(f"- Dimension '{dim}' is not present in the output.")
+
+        # Generate pseudo-code
+        pseudo_code = self._generate_pseudo_code_single_input(summed_dims, dim_to_size)
+        explanation.append("\nPseudo-code for the operation:")
+        explanation.extend(pseudo_code)
+
+        return explanation
+
+    def _generate_detailed_explanation_multi_input(self):
+        explanation = []
+        summed_dims = set(''.join(self.input_subscripts)) - set(self.output)
+        dim_to_size = self._get_dim_sizes()
+
+        # Explain dimensions involved in the operation
+        explanation.append("\nDetailed Steps:")
+        for dim in sorted(dim_to_size.keys()):
+            if dim in summed_dims:
+                explanation.append(f"- Dimension '{dim}' of size {dim_to_size[dim]} is summed over.")
+            elif dim in self.output:
+                explanation.append(f"- Dimension '{dim}' of size {dim_to_size[dim]} is retained in the output.")
+            else:
+                explanation.append(f"- Dimension '{dim}' is not present in the output.")
+
+        # Generate pseudo-code
+        pseudo_code = self._generate_pseudo_code_multi_input(summed_dims, dim_to_size)
+        explanation.append("\nPseudo-code for the operation:")
+        explanation.extend(pseudo_code)
+
+        return explanation
+
+    def _generate_pseudo_code_single_input(self, summed_dims, dim_to_size):
+        pseudo_code = []
+        dim_to_index = {dim: f"{dim}_idx" for dim in dim_to_size.keys()}
+        indent = ''
+
+        output_dims = [dim for dim in self.output]
+        input_subscripts = self.input_subscripts[0]
+
+        # Generate loops over output dimensions
+        for dim in output_dims:
+            index = dim_to_index[dim]
+            size = dim_to_size[dim]
+            pseudo_code.append(f"{indent}for {index} in range({size}):")
+            indent += '    '
+
+        # Initialize result element if summation is involved
+        if summed_dims:
+            result_indices = [dim_to_index[dim] for dim in output_dims]
+            pseudo_code.append(f"{indent}result[{', '.join(result_indices)}] = 0  # Initialize the result element")
+
+            # Generate loops over summed dimensions
+            for dim in summed_dims:
+                index = dim_to_index[dim]
+                size = dim_to_size[dim]
+                pseudo_code.append(f"{indent}for {index} in range({size}):")
+                indent += '    '
+
+            # Compute the result
+            input_indices = [dim_to_index[dim] for dim in input_subscripts]
+            output_indices = [dim_to_index[dim] for dim in self.output]
+            pseudo_code.append(
+                f"{indent}result[{', '.join(output_indices)}] += {self.matrix_names[0]}[{', '.join(input_indices)}]")
+        else:
+            # Direct assignment for transformations
+            input_indices = [dim_to_index[dim] for dim in input_subscripts]
+            output_indices = [dim_to_index[dim] for dim in self.output]
+            pseudo_code.append(
+                f"{indent}result[{', '.join(output_indices)}] = {self.matrix_names[0]}[{', '.join(input_indices)}]")
+
+        return pseudo_code
+
+    def _generate_pseudo_code_multi_input(self, summed_dims, dim_to_size):
+        pseudo_code = []
+        all_dims = set(''.join(self.input_subscripts))
+        dim_to_index = {dim: f"{dim}_idx" for dim in all_dims}
+        indent = ''
+
+        output_dims = [dim for dim in self.output]
+
+        # Generate loops over output dimensions
+        for dim in output_dims:
+            index = dim_to_index[dim]
+            size = dim_to_size[dim]
+            pseudo_code.append(f"{indent}for {index} in range({size}):")
+            indent += '    '
+
+        # Initialize result element if summation is involved
+        result_indices = [dim_to_index[dim] for dim in output_dims]
+        if summed_dims:
+            pseudo_code.append(f"{indent}result[{', '.join(result_indices)}] = 0  # Initialize the result element")
+
+        # Generate loops over summed dimensions
+        for dim in sorted(summed_dims):
+            index = dim_to_index[dim]
+            size = dim_to_size[dim]
+            pseudo_code.append(f"{indent}for {index} in range({size}):")
+            indent += '    '
+
+        # Compute the result
+        product_terms = [
+            f"{name}[{', '.join(dim_to_index[dim] for dim in subscripts)}]"
+            for name, subscripts in zip(self.matrix_names, self.input_subscripts)
+        ]
+        if summed_dims:
+            pseudo_code.append(f"{indent}result[{', '.join(result_indices)}] += " + " * ".join(product_terms))
+        else:
+            pseudo_code.append(f"{indent}result[{', '.join(result_indices)}] = " + " * ".join(product_terms))
+
+        return pseudo_code
+
+    def _calculate_total_flops(self):
+        # Simplified FLOPs calculation: number of multiplications and additions
+        dim_to_size = self._get_dim_sizes()
+        total_elements = 1
+        for dim in self.output:
+            total_elements *= dim_to_size[dim]
+        summed_dims = set(''.join(self.input_subscripts)) - set(self.output)
+        if summed_dims:
+            summed_elements = 1
+            for dim in summed_dims:
+                summed_elements *= dim_to_size[dim]
+            flops = 2 * total_elements * summed_elements  # Multiply and add
+        else:
+            # No summation, so only multiplications per output element
+            flops = total_elements  # One multiplication per output element
+        return flops
+
+    def _calculate_total_flops_single_input(self):
+        # Simplified FLOPs calculation for single input tensor
+        dim_to_size = self._get_dim_sizes_single_input()
+        summed_dims = set(self.input_subscripts[0]) - set(self.output)
+        if not summed_dims:
+            return 0  # No arithmetic operations
+        total_elements = 1
+        for dim in self.output:
+            total_elements *= dim_to_size[dim]
+        summed_elements = 1
+        for dim in summed_dims:
+            summed_elements *= dim_to_size[dim]
+        flops = total_elements * summed_elements  # Only additions in summations
+        return flops
+
+    def _get_dim_sizes(self):
+        dim_sizes = {}
+        for subscripts, shape in zip(self.input_subscripts, self.matrix_shapes_ordered):
+            for dim, size in zip(subscripts, shape):
+                if dim in dim_sizes and dim_sizes[dim] != size:
+                    raise ValueError(f"Inconsistent sizes for dimension '{dim}': {dim_sizes[dim]} vs {size}")
+                dim_sizes[dim] = size
+        return dim_sizes
+
+    def _get_dim_sizes_single_input(self):
+        dim_sizes = {}
+        subscripts = self.input_subscripts[0]
+        shape = self.matrix_shapes_ordered[0]
+        for dim, size in zip(subscripts, shape):
+            dim_sizes[dim] = size
+        return dim_sizes
+
+    def _calculate_output_shape(self):
+        output_shape = []
+        dim_sizes = self._get_dim_sizes()
+        for dim in self.output:
+            if dim not in dim_sizes:
+                raise ValueError(f"Dimension '{dim}' not found in any input")
+            output_shape.append(dim_sizes[dim])
+        return output_shape
 
     def _add_specific_explanations(self):
         explanations = []
@@ -117,96 +264,16 @@ class EinsumExplainer:
 
         if not self.output:
             explanations.append("\nNote: This operation results in a scalar (0-dimensional) output.")
-        elif self.inputs == self.output:
-            explanations.append("\nNote: This operation does not change the structure of the input.")
-        elif len(self.input_subscripts) == 1 and len(self.input_subscripts[0]) == 2 and len(self.output) == 2 and \
-                self.input_subscripts[0] != self.output:
-            explanations.append("\nNote: This operation transposes the input matrix, swapping its dimensions. This is a memory operation and doesn't involve arithmetic computations.")
-        elif input_dims and not output_dims:
-            explanations.append(f"\nNote: This operation sums over all dimensions {sorted(input_dims)}, resulting in a scalar output.")
-        elif len(self.input_subscripts) == 1 and len(set(self.input_subscripts[0])) == 1 and len(self.output) == 1:
-            explanations.append("\nNote: This operation extracts the diagonal elements of the input matrix. This involves selective memory access rather than arithmetic operations.")
-        elif len(self.input_subscripts) == 1 and len(set(self.input_subscripts[0])) == 1 and not self.output:
-            explanations.append("\nNote: This operation computes the trace of the input matrix (sum of diagonal elements).")
-        elif ',' in self.inputs and input_dims == output_dims:
-            explanations.append("\nNote: This operation performs element-wise multiplication without any summation.")
-        elif ',' in self.inputs and input_dims != output_dims:
-            explanations.append(f"\nNote: This operation involves both element-wise multiplication and summation over dimensions {sorted(summed_dims)}.")
-        elif input_dims != output_dims:
+        elif summed_dims:
             explanations.append(f"\nNote: This operation involves summation over dimensions {sorted(summed_dims)}.")
-
-        if len(self.input_subscripts) > 2:
-            explanations.append("\nNote: This is a multi-step operation involving multiple tensor contractions.")
-
+        elif len(self.matrix_names) == 1:
+            explanations.append("\nNote: This operation rearranges the input tensor without arithmetic computations.")
+        elif len(self.matrix_names) > 1:
+            explanations.append("\nNote: This operation performs element-wise multiplication without any summation.")
+        else:
+            explanations.append("\nNote: This operation rearranges the input tensor.")
         return explanations
 
-    def _calculate_flops(self, shapes, output_shape, summed_dims):
-        input_sizes = [reduce(operator.mul, shape, 1) for shape in shapes]
-        output_size = reduce(operator.mul, output_shape, 1)
-
-        if not summed_dims:
-            return max(sum(input_sizes), output_size)
-
-        summed_size = 1
-        for dim in summed_dims:
-            dim_size = None
-            for subscripts, shape in zip(self.input_subscripts, shapes):
-                if dim in subscripts:
-                    dim_index = subscripts.index(dim)
-                    if dim_index < len(shape):
-                        dim_size = shape[dim_index]
-                        break
-            if dim_size is None:
-                # If the dimension is not found in any input, assume it has size 1
-                dim_size = 1
-            summed_size *= dim_size
-
-        return 2 * output_size * summed_size
-
-    def _calculate_output_subscripts(self, *input_subscripts):
-        all_dims = set(''.join(input_subscripts))
-        common_dims = set.intersection(*map(set, input_subscripts))
-
-        summed_dims = common_dims - self.output_dims
-        dims_to_keep = (all_dims - summed_dims) | (self.output_dims & all_dims)
-
-        original_order = self.output + ''.join(set(''.join(input_subscripts)) - set(self.output))
-        intermediate_dims = ''.join(dim for dim in original_order if dim in dims_to_keep)
-
-        return intermediate_dims, summed_dims
-
-    def _calculate_intermediate_shape(self, new_subscripts, input_subscripts, input_shapes):
-        new_shape = []
-        for dim in new_subscripts:
-            for subscripts, shape in zip(input_subscripts, input_shapes):
-                if dim in subscripts:
-                    new_shape.append(shape[subscripts.index(dim)])
-                    break
-        return new_shape
-
-    def _calculate_output_shape(self):
-        output_shape = []
-        for dim in self.output:
-            size = None
-            for subscripts, shape in zip(self.input_subscripts, self.matrix_shapes.values()):
-                if dim in subscripts:
-                    dim_size = shape[subscripts.index(dim)]
-                    if size is None:
-                        size = dim_size
-                    elif size != dim_size:
-                        raise ValueError(f"Inconsistent sizes for dimension '{dim}': found {size} and {dim_size}")
-            if size is None:
-                raise ValueError(f"Dimension '{dim}' not found in any input")
-            output_shape.append(size)
-        return output_shape
-
-    def _validate_shapes(self, subscripts, shapes, summed_dims):
-        dim_sizes = {}
-        for subs, shape in zip(subscripts, shapes):
-            for dim, size in zip(subs, shape):
-                if dim in dim_sizes and dim_sizes[dim] != size:
-                    raise ValueError(f"Incompatible sizes for dimension '{dim}': {dim_sizes[dim]} != {size}")
-                dim_sizes[dim] = size
 
 def test():
     def run_test(name, einsum_expr, matrix_specs):
@@ -284,7 +351,7 @@ def test():
              "ab,bc,cd->ad",
              [('matrix_a', [2, 3]),
               ('matrix_b', [3, 4]),
-              ('matrix_c', [5, 6])])  # This should be [4, 6] to be compatible
+              ('matrix_c', [4, 6])])  # Corrected shape to [4, 6] to be compatible
 
 
 if __name__ == '__main__':
